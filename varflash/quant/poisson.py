@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import brentq, minimize
 from scipy.stats import poisson
 
 REGULATION_MINUTES = 90.0
@@ -24,6 +24,9 @@ EFFECTIVE_MINUTES = REGULATION_MINUTES + sum(STOPPAGE_MINUTES.values())
 RED_CARD_OWN_FACTOR = 0.67
 RED_CARD_OPP_FACTOR = 1.25
 MAX_GOALS = 12
+EXTRA_TIME_MINUTES = 30.0
+# Prior for matches priced only by a two-way "to advance" market.
+TYPICAL_TOTAL_GOALS = 2.5
 
 
 @dataclass(frozen=True)
@@ -86,13 +89,37 @@ class InPlayModel:
     def from_market(cls, p_home: float, p_draw: float, p_away: float) -> "InPlayModel":
         return cls(*fit_rates(p_home, p_draw, p_away))
 
+    @classmethod
+    def from_advance_price(cls, p_home_advances: float, total_goals: float = TYPICAL_TOTAL_GOALS) -> "InPlayModel":
+        """Fit from a two-way "to advance" price, which pins down only one degree of
+        freedom; the other comes from a prior on total expected goals."""
+
+        def gap(share):
+            m = cls(total_goals * share, total_goals * (1 - share))
+            return m.advance_probs(MatchState())[0] - p_home_advances
+
+        share = brentq(gap, 0.01, 0.99)
+        return cls(total_goals * share, total_goals * (1 - share))
+
+    def _rates(self, state: MatchState, minutes: float) -> tuple[float, float]:
+        frac = minutes / EFFECTIVE_MINUTES
+        mu_h = self.lambda_home * frac * RED_CARD_OWN_FACTOR**state.home_reds * RED_CARD_OPP_FACTOR**state.away_reds
+        mu_a = self.lambda_away * frac * RED_CARD_OWN_FACTOR**state.away_reds * RED_CARD_OPP_FACTOR**state.home_reds
+        return mu_h, mu_a
+
     def probs(self, state: MatchState) -> np.ndarray:
-        remaining = remaining_minutes(state.minute) / EFFECTIVE_MINUTES
-        mu_h = self.lambda_home * remaining
-        mu_a = self.lambda_away * remaining
-        mu_h *= RED_CARD_OWN_FACTOR**state.home_reds * RED_CARD_OPP_FACTOR**state.away_reds
-        mu_a *= RED_CARD_OWN_FACTOR**state.away_reds * RED_CARD_OPP_FACTOR**state.home_reds
+        """Regulation-time P(home win, draw, away win)."""
+        mu_h, mu_a = self._rates(state, remaining_minutes(state.minute))
         return outcome_probs(mu_h, mu_a, state.home_goals - state.away_goals)
 
     def probs_dict(self, state: MatchState) -> dict[str, float]:
         return dict(zip(("home", "draw", "away"), self.probs(state)))
+
+    def advance_probs(self, state: MatchState, home_penalty_win: float = 0.5) -> np.ndarray:
+        """Knockout P(home advances, away advances): regulation, then 30' extra time
+        (red cards carry over), then a shootout won by home with ``home_penalty_win``.
+        States inside extra time aren't modelled; ``state`` must be in regulation."""
+        reg_h, reg_d, reg_a = self.probs(state)
+        et_h, et_d, et_a = outcome_probs(*self._rates(state, EXTRA_TIME_MINUTES))
+        home = reg_h + reg_d * (et_h + et_d * home_penalty_win)
+        return np.array([home, 1.0 - home])

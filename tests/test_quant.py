@@ -31,6 +31,23 @@ def test_inplay_events_move_probabilities_the_right_way():
     assert m.probs_dict(disallowed) == pytest.approx(base)
 
 
+def test_advance_probs_include_extra_time_and_penalties():
+    m = InPlayModel(1.5, 1.0)
+    level_late = MatchState(minute=95, home_goals=1, away_goals=1)
+    p_home, p_away = m.advance_probs(level_late)
+    assert p_home + p_away == pytest.approx(1.0)
+    # Level at the death: mostly decided by extra time + pens, stronger side favoured.
+    assert 0.5 < p_home < 0.7
+    after_red = m.advance_probs(level_late.apply("red_card", "away"))
+    assert after_red[0] > p_home
+
+
+def test_fit_from_advance_price_roundtrip():
+    m = InPlayModel.from_advance_price(0.7)
+    assert m.advance_probs(MatchState())[0] == pytest.approx(0.7, abs=1e-6)
+    assert m.lambda_home > m.lambda_away
+
+
 def test_draw_converges_at_full_time():
     m = InPlayModel(1.5, 1.0)
     assert m.probs_dict(MatchState(minute=200, home_goals=2, away_goals=2))["draw"] == pytest.approx(1.0)

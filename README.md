@@ -58,6 +58,10 @@ varflash market analyze KXWCGAME-26JUL11ARGSUI # shocks + chart for one match
 varflash market scan KXWCGAME                  # shock table across the whole tournament
 ```
 
+Knockout games have two match markets: `KXWCGAME` (regulation-time 1X2: home / draw / away after
+90' + stoppage) and `KXWCADVANCE` (who goes through, including extra time and penalties). Both are
+supported; the in-play model prices extra time and a penalty shootout for the latter.
+
 Kickoff times aren't in Kalshi's API. Verified ones live in `config/kickoffs.csv`; otherwise the
 kickoff is estimated from the market close (final whistle).
 
@@ -86,6 +90,9 @@ varflash spotting eval --split test
 varflash backtest --event KXWCGAME-26JUL11ARGSUI --events examples/ARGSUI_events.csv
 ```
 
+How early does the AI VAR have to be? `python examples/signal_timing_sweep.py` sweeps the time the
+red-card verdict fires across Embolo's VAR review, in both markets.
+
 Events can be given as `video_s` (seconds into your recording, anchored with
 `--video-kickoff-s/--video-second-half-s`), `game_time` (`"2 - 27:00"`) or `utc`.
 
@@ -97,6 +104,10 @@ Events can be given as `video_s` (seconds into your recording, anchored with
   *market price just before the event + model-implied jump*. The Poisson model only says how
   far a goal / red card / overturned goal should move the price, so the strategy's edge
   comes from reacting first.
+- **Incident time vs verdict time.** For reviewed decisions the market is anchored at the moment
+  of the incident (`incident_utc` / `incident_video_s`), and the trade happens when the verdict is
+  ready. A late verdict then shows no edge instead of counting the event twice. The strategy only
+  trades in the event's direction, so it never fades a move it disagrees with in size.
 - **Probabilities, not verdicts.** The offside module turns a margin in metres into
   `P(offside) = Φ(margin / (√2·σ))`, where σ is per-player position error from detection and
   homography. A 3 cm call is a coin flip, and the sizing reflects that.

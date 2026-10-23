@@ -80,6 +80,31 @@ def test_fast_goal_signal_is_profitable_slow_one_is_not():
     assert not orders or run_orders(m, orders)["pnl"].sum() <= 0
 
 
+def test_late_verdict_anchored_at_incident_does_not_double_count():
+    m = _synthetic_match(goal_minute=30)  # market reprices at 31'
+    clock = MatchClock(KICKOFF)
+    incident = KICKOFF + pd.Timedelta(minutes=30)
+    late_verdict = KICKOFF + pd.Timedelta(minutes=35)
+    cfg = StrategyConfig(processing_latency_s=0, hold=pd.Timedelta("5min"))
+
+    naive = pd.DataFrame({"utc": [late_verdict], "event": ["goal"], "team": ["home"], "confidence": [1.0]})
+    _, naive_log = generate_orders(m, naive, clock, cfg)
+    _, anchored_log = generate_orders(m, naive.assign(incident_utc=[incident]), clock, cfg)
+    # Anchoring on the already-moved price counts the 0.50 -> 0.75 repricing twice
+    # (the naive fair value saturates near the 0.99 clip).
+    assert naive_log.iloc[0].fair_home - anchored_log.iloc[0].fair_home > 0.08
+    assert anchored_log.iloc[0].edge < naive_log.iloc[0].edge
+
+
+def test_never_fades_the_event():
+    m = _synthetic_match(goal_minute=30)
+    late = pd.DataFrame({"utc": [KICKOFF + pd.Timedelta(minutes=35)], "incident_utc": [KICKOFF + pd.Timedelta(minutes=30)],
+                         "event": ["goal"], "team": ["home"], "confidence": [1.0]})
+    _, log = generate_orders(m, late, MatchClock(KICKOFF), StrategyConfig())
+    d = log.iloc[0]
+    assert (d.role, d.side) in {("home", "yes"), ("draw", "no"), ("away", "no")}
+
+
 def test_average_precision():
     gts = pd.DataFrame({"video": ["a", "a", "b"], "time_s": [10.0, 100.0, 50.0]})
     perfect = pd.DataFrame({"video": ["a", "a", "b"], "time_s": [11.0, 99.0, 50.0], "confidence": [0.9, 0.8, 0.7]})

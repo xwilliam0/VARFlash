@@ -15,8 +15,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import pandas as pd
 
-from ..kalshi.store import MatchData
-from ..market.prices import ROLES, pre_match_probs
+from ..kalshi.store import MatchData, find_regulation_sibling
+from ..market.prices import pre_match_probs
 from ..quant.poisson import InPlayModel, MatchState
 from .clock import MatchClock, parse_game_time
 from .engine import Order, QuoteBook
@@ -39,11 +39,27 @@ class StrategyConfig:
     #   so we only bet on reaction speed, not on out-guessing the market's level.
     # "model": fair = raw Poisson model probabilities.
     anchor: str = "market"
+    # Only trade in the direction the event pushes each outcome. Otherwise, once
+    # the market has reacted, size disagreements with the model turn into fades.
+    with_event_only: bool = True
 
 
 def video_events_to_utc(events: pd.DataFrame, clock: MatchClock) -> pd.DataFrame:
-    """Accepts columns ``video_s`` or ``game_time`` ("2 - 13:20") or ``utc``."""
+    """Accepts columns ``video_s`` or ``game_time`` ("2 - 13:20") or ``utc``.
+
+    ``utc`` is when the model's verdict is ready. For reviewed decisions (VAR),
+    optionally give ``incident_utc`` / ``incident_video_s``: when the incident
+    itself happened, before anyone could react. The market price at that moment
+    is the anchor, so a verdict that arrives after the market has already moved
+    shows no edge instead of double-counting the event.
+    """
     ev = events.copy()
+    if "incident_video_s" in ev:
+        ev["incident_utc"] = ev["incident_video_s"].map(
+            lambda s: clock.video_to_utc(s) if pd.notna(s) else pd.NaT
+        )
+    if "incident_utc" in ev:
+        ev["incident_utc"] = pd.to_datetime(ev["incident_utc"], utc=True)
     if "utc" in ev:
         ev["utc"] = pd.to_datetime(ev["utc"], utc=True)
     elif "video_s" in ev:
@@ -58,9 +74,28 @@ def video_events_to_utc(events: pd.DataFrame, clock: MatchClock) -> pd.DataFrame
 
 
 def market_probs(match: MatchData, book: QuoteBook, ts: pd.Timestamp) -> np.ndarray:
-    """Normalised home/draw/away mids as of ``ts``."""
-    mids = np.array([sum(book.at(match.ticker_for(r), ts)) / 2 for r in ROLES])
+    """Normalised mids for ``match.outcome_roles`` as of ``ts``."""
+    mids = np.array([sum(book.at(match.ticker_for(r), ts)) / 2 for r in match.outcome_roles])
     return mids / mids.sum()
+
+
+def build_model(match: MatchData) -> InPlayModel:
+    """Fit scoring rates from pre-match prices.
+
+    "To advance" markets only give one number, so prefer the same game's
+    regulation 1X2 market when it has been downloaded.
+    """
+    if not match.is_advance_market:
+        pm = pre_match_probs(match)
+        return InPlayModel.from_market(pm["home"], pm["draw"], pm["away"])
+    sibling = find_regulation_sibling(match)
+    if sibling is not None:
+        return build_model(sibling)
+    return InPlayModel.from_advance_price(pre_match_probs(match)["home"])
+
+
+def model_probs(match: MatchData, model: InPlayModel, state: MatchState) -> np.ndarray:
+    return model.advance_probs(state) if match.is_advance_market else model.probs(state)
 
 
 def kelly_contracts(p_win: float, price: float, cfg: StrategyConfig) -> int:
@@ -85,9 +120,8 @@ def generate_orders(
     """Returns (orders, decision log). ``events`` must already have a ``utc`` column."""
     cfg = cfg or StrategyConfig()
     book = book or QuoteBook(match)
-    if model is None:
-        pm = pre_match_probs(match)
-        model = InPlayModel.from_market(pm["home"], pm["draw"], pm["away"])
+    model = model or build_model(match)
+    roles = match.outcome_roles
 
     state = MatchState()
     orders: list[Order] = []
@@ -98,10 +132,12 @@ def generate_orders(
         minute = clock.match_minute(ev.utc)
         before = MatchState(minute, state.home_goals, state.away_goals, state.home_reds, state.away_reds)
         after = before.apply(ev.event, ev.team)
-        p_before, p_after = model.probs(before), model.probs(after)
+        p_before, p_after = model_probs(match, model, before), model_probs(match, model, after)
         jump = ev.confidence * (p_after - p_before)
         if cfg.anchor == "market":
-            fair = market_probs(match, book, ev.utc) + jump
+            incident = getattr(ev, "incident_utc", pd.NaT)
+            anchor_ts = ev.utc if pd.isna(incident) else incident
+            fair = market_probs(match, book, anchor_ts) + jump
             fair = np.clip(fair, 0.01, 0.99)
             fair = fair / fair.sum()
         else:
@@ -111,9 +147,11 @@ def generate_orders(
 
         signal_ts = ev.utc + pd.Timedelta(seconds=cfg.broadcast_delay_s + cfg.processing_latency_s)
         best = None
-        for role, p_yes in zip(ROLES, fair):
+        for role, p_yes, move in zip(roles, fair, jump):
             ticker = match.ticker_for(role)
             for side, p_win in (("yes", p_yes), ("no", 1 - p_yes)):
+                if cfg.with_event_only and (move > 0) != (side == "yes"):
+                    continue
                 price = book.entry_price(ticker, side, signal_ts)
                 edge = p_win - price - fee_per_contract(price)
                 if best is None or edge > best[0]:
@@ -129,7 +167,7 @@ def generate_orders(
                 "event": ev.event,
                 "team": ev.team,
                 "confidence": ev.confidence,
-                **{f"fair_{r}": round(p, 3) for r, p in zip(ROLES, fair)},
+                **{f"fair_{r}": round(p, 3) for r, p in zip(roles, fair)},
                 "role": role,
                 "side": side,
                 "price": price,

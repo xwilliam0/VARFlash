@@ -128,6 +128,16 @@ class MatchData:
                 return self.roles.get(m["ticker"])
         return None
 
+    @property
+    def outcome_roles(self) -> list[str]:
+        """['home', 'draw', 'away'] for 1X2 markets, ['home', 'away'] for "to advance" markets."""
+        present = set(self.roles.values())
+        return [r for r in ("home", "draw", "away") if r in present]
+
+    @property
+    def is_advance_market(self) -> bool:
+        return "draw" not in self.outcome_roles
+
     def ticker_for(self, role: str) -> str:
         for t, r in self.roles.items():
             if r == role:
@@ -241,7 +251,11 @@ def load_match(path: Path | str, kickoff: str | pd.Timestamp | None = None) -> M
         trades=trades,
         roles=outcome_codes(meta["event"]["event_ticker"], [m["ticker"] for m in markets]),
     )
-    known_kickoff, known_second_half = known_kickoffs().get(match.event_ticker, (None, None))
+    known = known_kickoffs()
+    by_game = {game_key(t): v for t, v in known.items()}
+    known_kickoff, known_second_half = known.get(
+        match.event_ticker, by_game.get(game_key(match.event_ticker), (None, None))
+    )
     kickoff = kickoff if kickoff is not None else known_kickoff
     match.kickoff = (
         utc(kickoff) if kickoff is not None else match.close_time - DEFAULT_KICKOFF_BEFORE_CLOSE
@@ -259,6 +273,22 @@ def known_kickoffs(path: Path = KICKOFFS_CSV) -> dict[str, tuple[str | None, str
     return {
         r.event_ticker: (r.kickoff_utc or None, r.second_half_utc or None) for r in df.itertuples()
     }
+
+
+def game_key(event_ticker: str) -> str:
+    """Series-independent id of the game, e.g. '26JUL11ARGSUI'."""
+    return event_ticker.split("-")[-1]
+
+
+def find_regulation_sibling(match: MatchData, root: Path = KALSHI_DATA) -> MatchData | None:
+    """The same game's downloaded regulation-time (home/draw/away) market, if any."""
+    for meta in root.glob(f"*/*-{game_key(match.event_ticker)}/event.json"):
+        if meta.parent.name == match.event_ticker:
+            continue
+        other = load_match(meta.parent)
+        if not other.is_advance_market:
+            return other
+    return None
 
 
 def find_event_dir(event_ticker: str, root: Path = KALSHI_DATA) -> Path:

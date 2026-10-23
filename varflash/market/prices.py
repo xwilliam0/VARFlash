@@ -34,7 +34,8 @@ def quotes(match: MatchData) -> pd.DataFrame:
 
 
 def implied_probs(match: MatchData, source: str = "candles", freq: str = "5s") -> pd.DataFrame:
-    """Normalised (overround-free) probabilities for home/draw/away.
+    """Normalised (overround-free) probabilities per outcome: home/draw/away for
+    regulation-time markets, home/away for knockout "to advance" markets.
 
     ``source="candles"`` uses minute bid/ask mids; ``source="trades"`` uses the
     last traded price resampled to ``freq`` (finer, but noisier).
@@ -53,7 +54,7 @@ def implied_probs(match: MatchData, source: str = "candles", freq: str = "5s") -
         )
     else:
         raise ValueError(f"unknown source {source!r}")
-    raw = raw.reindex(columns=list(ROLES)).dropna()
+    raw = raw.reindex(columns=match.outcome_roles).dropna()
     return raw.div(raw.sum(axis=1), axis=0)
 
 

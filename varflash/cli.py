@@ -68,9 +68,7 @@ def _analyze(event_dir: Path, a) -> pd.DataFrame:
     shocks = detect_shocks(in_play, window=a.window, threshold=a.threshold)
     shocks.insert(0, "event_ticker", m.event_ticker)
     shocks["minutes_after_kickoff"] = (shocks["peak"] - m.kickoff).dt.total_seconds() / 60
-    shocks["team"] = shocks["role"].map(
-        {r: m.ticker_for(r).split("-")[-1] for r in ("home", "away", "draw")}
-    )
+    shocks["team"] = shocks["role"].map({r: m.ticker_for(r).split("-")[-1] for r in m.outcome_roles})
     if a.plot:
         plot_match(m, probs, shocks, out=OUTPUTS / f"{m.event_ticker}_market.png")
     return shocks
