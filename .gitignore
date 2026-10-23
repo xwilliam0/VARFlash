@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Large / regenerable artifacts
+data/
+models/
+runs/
+outputs/
+*.pt
+*.mp4
+*.mkv
+
+# Personal research notes
+BasicBackgroundResearch.pdf

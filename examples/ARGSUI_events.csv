@@ -1,0 +1,4 @@
+game_time,event,team,confidence,note
+1 - 10:00,goal,home,1.0,Mac Allister 10' (minute-level time from match report)
+2 - 22:00,goal,away,1.0,Ndoye 67'
+2 - 27:00,red_card,away,0.9,"Embolo 2nd yellow for simulation after VAR review, 72'"
