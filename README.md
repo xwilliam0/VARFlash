@@ -38,7 +38,8 @@ flowchart LR
 | `varflash.market` | Overround-free implied probabilities from bid/ask or trades; **shock detection** (where the market repriced, i.e. where something happened on the pitch). |
 | `varflash.quant` | In-play Poisson model. Backs out each team's scoring rate from pre-match prices, then prices any state (minute, score, red cards). Generalises to any match with no per-team training. |
 | `varflash.vision` | Detection + tracking (Ultralytics YOLO, ByteTrack), Lab-colour team clustering, keypoint homography, Law-11 offside geometry with a calibrated **P(offside)** under position noise, overlays + minimap. |
-| `varflash.spotting` | Temporal action-spotting network (dilated TCN + BiGRU) trained on SoccerNet-v2 (500 matches, 17 event classes), SoccerNet-style tolerance AP. CPU-trainable. |
+| `varflash.spotting` | Temporal action-spotting network (dilated TCN + BiGRU, or a causal past-only variant for live alerts) trained on SoccerNet-v2 (500 matches, 17 event classes). Card detector, isotonic confidence calibration, live-latency metrics, SoccerNet's official evaluator, and a PyTorch re-implementation of SoccerNet's ResNet-152 + PCA feature extractor for new matches. |
+| `varflash.opendata` | StatsBomb open event data: card rates, foul-to-card probabilities, red-card scoring effect. |
 | `varflash.backtest` | Video ↔ match ↔ UTC clock, Kalshi fee schedule, quote book that never peeks ahead, fractional-Kelly strategy, markouts and PnL. |
 
 ## Quickstart
@@ -79,10 +80,53 @@ python examples/synthetic_var_review.py   # ground-truth check on a rendered fra
 ### 3. Train the event spotter
 
 ```bash
-varflash spotting download            # ~11 GB of SoccerNet features + labels, no NDA needed
-varflash spotting train --epochs 15   # CPU is fine
-varflash spotting eval --split test
+varflash spotting download                    # ~11 GB of SoccerNet features + labels, no NDA needed
+varflash spotting train                       # 17 classes; early stopping on validation mAP; GPU if available
+varflash spotting eval --split test           # AP per class, calibration (and live latency for causal models)
+varflash spotting official-eval               # SoccerNet's official average-mAP (loose / tight)
+
+# Card detector: all classes as auxiliary tasks, both reds merged into "Sending off"
+varflash spotting train --classes cards_multitask --out models/cards.pt
+# Live version: past-only model allowed 10 s of look-ahead before it must fire
+varflash spotting train --classes cards_multitask --causal --delay 10 --out models/cards_live.pt
 ```
+
+Second stage, from raw pixels (needs the 224p videos, i.e. the SoccerNet NDA): the feature spotter
+proposes card moments, and a visual model (ImageNet RegNetY-800MF fine-tuned end to end on 4 fps
+frames + a BiGRU) looks at a 12 s clip around each one. Scores are fused by a logistic regression
+fitted on the validation split.
+
+```bash
+varflash spotting download --files 1_224p.mkv 2_224p.mkv   # ~190 GB
+varflash cards build-clips      # candidates + card / no-card-foul / random clips, stored as JPEG
+varflash cards train            # -> models/card_vision.pt
+varflash cards rescore          # test AP: spotter vs visual vs fused
+```
+
+On ORCD Engaging, `sbatch scripts/spotting_sweep.sbatch` trains the baseline and all card-model
+ablations (3 seeds) on one GPU, and `python scripts/summarize_sweep.py` prints the scorecard.
+
+### 3b. Run the spotter on a new match
+
+SoccerNet's features come from Keras' ImageNet ResNet-152 on 2 fps, centre-cropped 224×224 frames,
+reduced to 512-d by PCA. `varflash.spotting.features` re-implements that backbone in PyTorch
+(Keras weights loaded from the original `.h5`; matches Keras to 6e-7 relative error, including
+SoccerNet's BGR/RGB channel quirk) and recovers the PCA exactly by least squares from
+SoccerNet's own raw/PCA feature pairs, so no TensorFlow is needed.
+
+```bash
+varflash spotting download --splits valid --max-games 10 --files 1_ResNET_TF2.npy 2_ResNET_TF2.npy
+varflash spotting fit-pca                                  # -> models/backbones/soccernet_pca512.npz
+varflash spotting extract --video match.mp4 --out feats/   # ~1 min per half on one L40S
+varflash spotting kickoffs --features feats/1_ResNET_TF2_PCA512.npy --game 26JUL11ARGSUI
+varflash spotting kickoffs --game 26JUL11ARGSUI --video-name match.mp4 --record 312 3605 --verified
+varflash spotting spot --features feats/1_ResNET_TF2_PCA512.npy --model models/cards_live.pt \
+                       --backtest-csv events.csv          # goals / red cards, fill in `team`
+varflash backtest --event KXWCGAME-26JUL11ARGSUI --events events.csv   # uses the verified kickoffs
+```
+
+Verified video kickoffs live in `config/video_kickoffs.csv`. Match videos are git-ignored; keep
+broadcast footage for personal research only.
 
 ### 4. Backtest
 
@@ -119,8 +163,10 @@ Events can be given as `video_s` (seconds into your recording, anchored with
 
 - The demo `examples/ARGSUI_events.csv` uses minute-level times from match reports, which can
   land up to a minute early and *look* like edge. Real conclusions need video timestamps.
-- The spotter is trained on SoccerNet's ResNet-152 (TF2) + PCA-512 features. Running it on new
-  broadcasts needs the same feature extractor (next step), or retraining on features you extract.
+- Sending-offs are rare (58 in SoccerNet's train split). Features alone reach 0.21 test AP; the
+  raw-frame second stage lifts it to 0.55, but still from 22 test events, and the visual stage
+  needs ~6 s of video after a candidate. Next: a causal visual model and SoccerNet-MVFouls
+  foul-severity labels (predict the card from the foul, before the referee shows it).
 - Homography is from manually clicked keypoints. Next: a pitch-keypoint detector for per-frame
   calibration, and fine-tuning YOLO on football classes (player / goalkeeper / referee / ball).
 - The in-play model has a constant scoring rate. `market scan` across hundreds of Kalshi matches
@@ -132,4 +178,6 @@ Events can be given as `video_s` (seconds into your recording, anchored with
 
 - **Kalshi**: public market-data endpoints, read-only. No trading code exists in this repo.
 - **SoccerNet** features and labels are public. Raw videos require signing SoccerNet's NDA.
+- **StatsBomb** open data (`varflash opendata statsbomb`: card rates, red-card scoring effect) is
+  free for research with attribution: https://github.com/statsbomb/open-data
   Use your own recordings for personal research only.

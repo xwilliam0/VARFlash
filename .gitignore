@@ -6,9 +6,12 @@ __pycache__/
 
 # Large / regenerable artifacts
 data/
+/data
 models/
 runs/
 outputs/
+logs/
+logs_*.out
 *.pt
 *.mp4
 *.mkv
