@@ -140,6 +140,26 @@ red-card verdict fires across Embolo's VAR review, in both markets.
 Events can be given as `video_s` (seconds into your recording, anchored with
 `--video-kickoff-s/--video-second-half-s`), `game_time` (`"2 - 27:00"`) or `utc`.
 
+### 5. Replay GUI
+
+The match video with the live model's scores and alerts, its trades, and the Kalshi book on one clock.
+"Live mode" hides everything the system could not have known yet at the playhead.
+
+![Replay GUI: Argentina vs Switzerland highlights against the Kalshi "to advance" market](docs/replay_gui.png)
+
+```bash
+# a SoccerNet game (ground truth from its labels, no market)
+varflash replay build --name napoli-milan --game-dir "data/soccernet/italy_serie-a/2016-2017/2016-08-27 - 21-45 Napoli 4 - 2 AC Milan"
+# your own recording of a Kalshi-listed match (teams for trading come from the match report)
+varflash replay build --name argsui --video match.mp4 --event KXWCGAME-26JUL11ARGSUI --report examples/ARGSUI_events.csv
+# official highlights: each clip anchored to wall-clock time (event frame = Kalshi's move onset)
+varflash replay build --name argsui-highlights --video argsui_highlights.mp4 \
+  --clips config/replay_clips/argsui_highlights.csv --event KXWCADVANCE-26JUL11ARGSUI --hold-min 2
+varflash replay serve   # prints http://localhost:<port>/; Cursor / `ssh -L` forwards the port
+```
+
+Build on a compute node (feature extraction needs a GPU for new videos); serving is lightweight.
+
 ## Design notes
 
 - **No look-ahead.** Candles are stamped at the end of their minute and the quote book only joins

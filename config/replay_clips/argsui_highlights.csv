@@ -1,0 +1,6 @@
+clip_start_s,clip_end_s,event_s,event_utc,minute,label,team,note
+6.0,17.5,14.0,2026-07-12T01:10:09Z,10,Goal,home,"Mac Allister header from Messi corner; utc = KXWCADVANCE onset 0.75->0.89"
+24.0,36.0,32.8,2026-07-12T02:28:12Z,67,Goal,away,"Ndoye; utc = KXWCADVANCE onset 0.91->0.73"
+40.5,55.5,51.5,2026-07-12T02:31:31Z,72,Sending off,away,"Embolo second yellow (simulation) after review; utc = KXWCGAME onset 0.34->0.52"
+75.0,88.0,82.5,2026-07-12T03:32:00Z,112,Goal,home,"Julian Alvarez (extra time); utc = KXWCADVANCE onset 0.66->0.98"
+96.0,110.0,105.0,2026-07-12T03:39:31Z,121,Goal,home,"Lautaro Martinez follow-up after Kobel save (120+1); utc = KXWCADVANCE 0.97->0.99, low confidence"

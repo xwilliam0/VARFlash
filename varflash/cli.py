@@ -378,7 +378,7 @@ def cmd_opendata_statsbomb(a):
 
 
 def cmd_backtest(a):
-    from .backtest import (MatchClock, StrategyConfig, generate_orders, markouts, run_orders,
+    from .backtest import (MatchClock, generate_orders, markouts, run_orders,
                            summarize, video_events_to_utc)
     from .backtest.engine import QuoteBook
     from .kalshi.store import find_event_dir, load_match
@@ -401,11 +401,7 @@ def cmd_backtest(a):
     )
     raw_events = pd.read_csv(a.events)
     events = video_events_to_utc(raw_events, clock)
-    cfg = StrategyConfig(
-        broadcast_delay_s=a.delay, processing_latency_s=a.latency, min_edge=a.min_edge,
-        bankroll=a.bankroll, hold=None if a.to_settlement else pd.Timedelta(minutes=a.hold_min),
-        anchor=a.anchor,
-    )
+    cfg = _strategy_config(a)
     book = QuoteBook(m)
     orders, decisions = generate_orders(m, events, clock, cfg, book=book)
     fills = run_orders(m, orders, book)
@@ -434,6 +430,49 @@ def cmd_backtest(a):
             "second-half kickoff may be estimated). Signals can land up to a minute early, which "
             "looks like edge but is look-ahead. Use video timestamps for real conclusions."
         )
+
+
+def _strategy_config(a):
+    from .backtest import StrategyConfig
+
+    return StrategyConfig(
+        broadcast_delay_s=a.delay, processing_latency_s=a.latency, min_edge=a.min_edge,
+        bankroll=a.bankroll, hold=None if a.to_settlement else pd.Timedelta(minutes=a.hold_min),
+        anchor=a.anchor,
+    )
+
+
+# ---- replay GUI -----------------------------------------------------------
+
+
+def cmd_replay_build(a):
+    from .replay import build_session, soccernet_game_inputs
+
+    inputs = {"videos": a.video, "features": a.features, "labels": a.labels}
+    if a.game_dir:
+        inputs = {**soccernet_game_inputs(Path(a.game_dir)), **{k: v for k, v in inputs.items() if v}}
+    if not inputs["videos"]:
+        raise SystemExit("give --game-dir or --video")
+    out = build_session(
+        a.name, inputs["videos"],
+        features=Path(inputs["features"]) if inputs["features"] else None,
+        labels=Path(inputs["labels"]) if inputs["labels"] else None,
+        report=Path(a.report) if a.report else None,
+        live_model=Path(a.model),
+        hindsight_model=None if a.hindsight_model.lower() == "none" else Path(a.hindsight_model),
+        event=a.event, kickoff=a.kickoff,
+        video_kickoff_s=a.video_kickoff_s, video_second_half_s=a.video_second_half_s,
+        strategy=_strategy_config(a), trade_min_confidence=a.trade_min_confidence,
+        match_tol_s=a.match_tol_s, note=a.note, device=a.device,
+        clips=Path(a.clips) if a.clips else None, clip_pad_s=tuple(a.clip_pad),
+    )
+    print(f"session -> {out}\nview it with: varflash replay serve")
+
+
+def cmd_replay_serve(a):
+    from .replay.server import serve
+
+    serve(a.host, a.port)
 
 
 # ---- parser ---------------------------------------------------------------
@@ -617,6 +656,42 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--second-half")
     b.add_argument("--video-kickoff-s", type=float, help="default: verified entry in config/video_kickoffs.csv, else 0")
     b.add_argument("--video-second-half-s", type=float)
+    _add_strategy_args(b)
+    b.set_defaults(fn=cmd_backtest)
+
+    rp = groups.add_parser("replay", help="GUI: match video + model alerts + trades + Kalshi market").add_subparsers(
+        dest="cmd", required=True)
+    s = rp.add_parser("build", help="assemble a replay session (video.mp4 + session.json)")
+    s.add_argument("--name", required=True, help="session name (directory under outputs/replay)")
+    s.add_argument("--game-dir", help="a downloaded SoccerNet game: both 224p halves, features and labels")
+    s.add_argument("--video", nargs="+", help="one full-match file, or one file per half")
+    s.add_argument("--features", help="feature dir ({1,2}_ResNET_TF2_PCA512.npy) or .npy; default: extract")
+    s.add_argument("--labels", help="SoccerNet Labels-v2.json (ground truth + teams)")
+    s.add_argument("--report", help="match-report CSV in `backtest --events` format (ground truth + teams)")
+    s.add_argument("--model", default=str(MODELS / "live_d10.pt"), help="live (causal) spotter that drives trades")
+    s.add_argument("--hindsight-model", default=str(MODELS / "spotter.pt"), help="'none' to skip")
+    s.add_argument("--event", help="Kalshi event ticker (enables the market and trade panels)")
+    s.add_argument("--kickoff")
+    s.add_argument("--video-kickoff-s", type=float, help="default: config/video_kickoffs.csv, else start of video")
+    s.add_argument("--video-second-half-s", type=float, help="default: config, else start of the 2nd file")
+    s.add_argument("--trade-min-confidence", type=float, default=0.3, help="calibrated alert confidence to trade")
+    s.add_argument("--match-tol-s", type=float, default=60.0, help="alert <-> reference event matching window")
+    s.add_argument("--clips", help="highlights mode: CSV of clips in --video anchored to wall-clock time "
+                                   "(see config/replay_clips/)")
+    s.add_argument("--clip-pad", nargs=2, type=float, default=[45.0, 150.0], metavar=("BEFORE", "AFTER"),
+                   help="seconds of frozen frame before/after each clip, so the market keeps running")
+    s.add_argument("--note", default="", help="banner shown in the GUI")
+    s.add_argument("--device")
+    _add_strategy_args(s)
+    s.set_defaults(fn=cmd_replay_build)
+    s = rp.add_parser("serve", help="serve the GUI (open the printed URL; Cursor forwards the port)")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8765)
+    s.set_defaults(fn=cmd_replay_serve)
+    return p
+
+
+def _add_strategy_args(b: argparse.ArgumentParser) -> None:
     b.add_argument("--delay", type=float, default=0.0, help="broadcast delay of your feed (s)")
     b.add_argument("--latency", type=float, default=2.0, help="model + order latency (s)")
     b.add_argument("--min-edge", type=float, default=0.03)
@@ -625,8 +700,6 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--to-settlement", action="store_true")
     b.add_argument("--anchor", choices=["market", "model"], default="market",
                    help="fair value = market + model jump (default) or raw model")
-    b.set_defaults(fn=cmd_backtest)
-    return p
 
 
 def main(argv=None):

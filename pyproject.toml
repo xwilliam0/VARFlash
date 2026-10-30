@@ -30,5 +30,8 @@ varflash = "varflash.cli:main"
 [tool.setuptools.packages.find]
 include = ["varflash*"]
 
+[tool.setuptools.package-data]
+"varflash.replay" = ["static/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
