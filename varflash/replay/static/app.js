@@ -96,19 +96,30 @@ async function init() {
   }
   const want = new URLSearchParams(location.search).get("s");
   sel.value = sessions.some((s) => s.name === want) ? want : sessions[0].name;
-  sel.onchange = () => { history.replaceState(null, "", `?s=${encodeURIComponent(sel.value)}`); load(sel.value); };
+  ui.model = new URLSearchParams(location.search).get("m");
+  sel.onchange = () => { syncUrl(); load(sel.value); };
+  $("model").onchange = async (e) => { ui.model = e.target.value; syncUrl(); await useModel(ui.model); };
   await load(sel.value);
 }
+
+function syncUrl() {
+  const q = new URLSearchParams({ s: $("session").value });
+  if (ui.model) q.set("m", ui.model);
+  history.replaceState(null, "", `?${q}`);
+}
+
+const MODEL_FIELDS = ["live", "alerts", "scorecard", "decisions", "fills", "summary"];
 
 async function load(name) {
   const base = `/sessions/${encodeURIComponent(name)}/`;
   S = await (await fetch(base + "session.json")).json();
   S.base = base;
-  S.alerts.sort((a, b) => a.fire_s - b.fire_s);
-  S.alertFire = S.alerts.map((a) => a.fire_s);
+  S.models = S.models || [{ key: "default", label: "live model" }];
+  S.modelCache = { [S.models[0].key]: Object.fromEntries(MODEL_FIELDS.map((k) => [k, S[k]])) };
+  S.allClasses = S.live.model.classes;
   S.truth.sort((a, b) => a.video_s - b.video_s);
-  S.decisions.sort((a, b) => a.video_s - b.video_s);
-  S.tradedAlerts = new Set(S.decisions.filter((d) => d.contracts > 0).map((d) => d.alert_id));
+  $("model").innerHTML = S.models.map((m) => `<option value="${m.key}">${m.label}</option>`).join("");
+  $("model").disabled = S.models.length < 2;
   if (S.market) {
     const tp = S.market.tape, idx = tp.v.map((_, i) => i).sort((a, b) => tp.v[a] - tp.v[b]);
     for (const k of Object.keys(tp)) tp[k] = idx.map((i) => tp[k][i]);
@@ -120,15 +131,27 @@ async function load(name) {
   $("tape-card").hidden = !S.market;
   $("trades-card").hidden = !S.market;
   $("min-conf").value = ui.minConf = S.trade_min_confidence ?? 0.3;
+  video.src = S.base + S.video;
+  await useModel(S.models.some((m) => m.key === ui.model) ? ui.model : S.models[0].key);
+}
+
+async function useModel(key) {
+  if (!S.modelCache[key]) S.modelCache[key] = await (await fetch(S.base + `model_${encodeURIComponent(key)}.json`)).json();
+  Object.assign(S, Object.fromEntries(MODEL_FIELDS.map((k) => [k, S.modelCache[key][k]])));
+  S.modelLabel = S.models.find((m) => m.key === key).label;
+  $("model").value = key;
+  S.alerts.sort((a, b) => a.fire_s - b.fire_s);
+  S.alertFire = S.alerts.map((a) => a.fire_s);
+  S.decisions.sort((a, b) => a.video_s - b.video_s);
+  S.tradedAlerts = new Set(S.decisions.filter((d) => d.contracts > 0).map((d) => d.alert_id));
   buildToggles();
   renderScorecard();
   listKeys = {};
-  video.src = S.base + S.video;
   ui.dirty = true;
 }
 
 function buildToggles() {
-  const classes = S.live.model.classes;
+  const classes = S.allClasses;
   const order = [...DEFAULT_ON.filter((c) => classes.includes(c)), ...classes.filter((c) => !DEFAULT_ON.includes(c))];
   $("class-toggles").innerHTML = order.map((c) => `<label><input type="checkbox" data-cls="${c}" ${ui.enabled.has(c) ? "checked" : ""}>
     <span class="swatch" style="background:${CLASS_COLORS[c] || "#888"}"></span>${c}</label>`).join("");
@@ -143,7 +166,9 @@ function renderScorecard() {
     const lat = r.median_latency_s == null ? "" : `, median ${r.median_latency_s >= 0 ? "+" : ""}${r.median_latency_s.toFixed(0)}s`;
     return `<b>${r.label}</b> ${r.caught}/${r.events} caught, ${r.false_alarms} false${lat}`;
   });
-  $("scorecard").innerHTML = `live model (${S.live.model.causal ? `causal, ${d}s look-ahead` : "NOT causal"}), conf ≥ ${S.trade_min_confidence}: ` +
+  const how = S.live.model.kind === "vision" ? `raw frames, ${S.live.model.context_s}s context, no look-ahead`
+    : S.live.model.causal ? `causal, ${d}s look-ahead` : "NOT causal";
+  $("scorecard").innerHTML = `${S.modelLabel} (${how}), conf ≥ ${S.trade_min_confidence}: ` +
     (parts.join(" · ") || "no reference events");
 }
 

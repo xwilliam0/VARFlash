@@ -1,0 +1,1 @@
+Argentina-Switzerland (Kalshi 'to advance' market), FIFA highlights. Each clip is placed so its event frame = the moment Kalshi's price started moving, so this shows the market's reaction and the model's trades, but cannot measure whether the market led or lagged the video. Frozen frames pad each clip so the market keeps running.

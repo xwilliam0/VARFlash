@@ -30,16 +30,21 @@ def _backbone(name: str, pretrained: bool) -> tuple[nn.Module, int]:
 
 
 class CardNet(nn.Module):
-    """(B, T, 3, H, W) uint8-range RGB frames -> (B, T, n_classes) logits."""
+    """(B, T, 3, H, W) uint8-range RGB frames -> (B, T, n_classes) logits.
+
+    ``causal``: forward-only GRU, so the output at frame t only depends on frames <= t.
+    """
 
     def __init__(self, backbone: str = "regnet_y_800mf", n_classes: int = 2, dim: int = 256,
-                 dropout: float = 0.3, pretrained: bool = True):
+                 dropout: float = 0.3, pretrained: bool = True, causal: bool = False):
         super().__init__()
+        self.causal = causal
         self.backbone, feat = _backbone(backbone, pretrained)
         self.register_buffer("mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1) * 255)
         self.register_buffer("std", torch.tensor(IMAGENET_STD).view(1, 3, 1, 1) * 255)
         self.proj = nn.Sequential(nn.Dropout(dropout), nn.Linear(feat, dim), nn.ReLU())
-        self.gru = nn.GRU(dim, dim // 2, num_layers=2, batch_first=True, bidirectional=True, dropout=dropout)
+        self.gru = nn.GRU(dim, dim if causal else dim // 2, num_layers=2, batch_first=True,
+                          bidirectional=not causal, dropout=dropout)
         self.head = nn.Linear(dim, n_classes)
 
     def forward(self, x):

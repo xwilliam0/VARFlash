@@ -5,6 +5,14 @@ SoccerNet's ``ResNET_TF2_PCA512`` features come from Keras' ImageNet ResNet-152
 512-d. This module re-implements that backbone in PyTorch (so it runs on any GPU
 without TensorFlow), loads the original Keras ``.h5`` weights, and recovers the PCA
 as an affine map fitted on SoccerNet's own (raw 2048-d, PCA-512) feature pairs.
+
+Why bother matching exactly: the spotters in ``model.py`` are trained on the
+released SoccerNet features, so features for a new match must come from the same
+weights, preprocessing quirks and frame grid or the spotter sees a shifted input
+distribution. The backbone is only ever run frozen (eval mode, no gradients).
+
+Pipeline: video -> 2 fps frames -> 224x224 crop -> caffe preprocessing
+-> ResNet-152 (2048-d) -> PCA (512-d) -> ``{half}_ResNET_TF2_PCA512.npy``.
 """
 
 from __future__ import annotations
@@ -29,8 +37,11 @@ KERAS_WEIGHTS_URL = (
 KERAS_WEIGHTS = MODELS / "backbones" / "resnet152_weights_tf_dim_ordering_tf_kernels.h5"
 PCA_FILE = MODELS / "backbones" / "soccernet_pca512.npz"
 RAW_FILE = "{half}_ResNET_TF2.npy"
+# Keras "caffe" preprocessing: subtract ImageNet per-channel means, no scaling to [0, 1].
 CAFFE_MEAN_BGR = (103.939, 116.779, 123.68)
+# Keras' BatchNorm epsilon (PyTorch defaults to 1e-5); needed for bit-level parity.
 BN_EPS = 1.001e-5
+# Bottleneck blocks per stage; this is what makes it ResNet-152 rather than -50 (3, 4, 6, 3).
 RESNET152_BLOCKS = (3, 8, 36, 3)
 
 
@@ -46,7 +57,10 @@ class KerasBottleneck(nn.Module):
 
     def __init__(self, cin: int, filters: int, stride: int, shortcut_conv: bool):
         super().__init__()
+        # 1x1 squeeze to ``filters`` channels, 3x3 at that width, 1x1 expand to 4x.
         cout = 4 * filters
+        # The first block of each stage changes width/resolution, so its skip path
+        # needs a projecting 1x1 conv; later blocks add the input back unchanged.
         self.shortcut = nn.Sequential(nn.Conv2d(cin, cout, 1, stride), _bn(cout)) if shortcut_conv else nn.Identity()
         self.conv1, self.bn1 = nn.Conv2d(cin, filters, 1, stride), _bn(filters)
         self.conv2, self.bn2 = nn.Conv2d(filters, filters, 3, 1, padding=1), _bn(filters)
@@ -64,11 +78,14 @@ class KerasResNet152(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv1, self.bn1 = nn.Conv2d(3, 64, 7, 2, padding=3), _bn(64)
+        # Keras zero-pads explicitly before max-pooling; PyTorch's MaxPool2d padding uses -inf.
         self.pool = nn.Sequential(nn.ZeroPad2d(1), nn.MaxPool2d(3, 2))
         stages, cin = [], 64
+        # Four stages at 56, 28, 14, 7 px; outputs 256, 512, 1024, 2048 channels.
         for s, (n, filters) in enumerate(zip(RESNET152_BLOCKS, (64, 128, 256, 512))):
             blocks = []
             for b in range(n):
+                # Only the first block of stages 2-4 downsamples (stride 2).
                 blocks.append(KerasBottleneck(cin, filters, (1 if s == 0 else 2) if b == 0 else 1, b == 0))
                 cin = 4 * filters
             stages.append(nn.Sequential(*blocks))
@@ -76,10 +93,15 @@ class KerasResNet152(nn.Module):
 
     def forward(self, x):
         x = self.pool(torch.relu(self.bn1(self.conv1(x))))
-        return self.stages(x).mean(dim=(2, 3))
+        return self.stages(x).mean(dim=(2, 3))  # global average pool: (B, 2048, 7, 7) -> (B, 2048)
 
 
 def _keras_layer_map(model: KerasResNet152) -> dict[str, nn.Module]:
+    """Keras layer name (as stored in the ``.h5``) -> the matching PyTorch module.
+
+    Keras names layers ``conv{stage}_block{block}_{i}_{conv|bn}``, with stage
+    starting at 2 and ``i = 0`` being the shortcut projection.
+    """
     out = {"conv1_conv": model.conv1, "conv1_bn": model.bn1}
     for s, stage in enumerate(model.stages):
         for b, blk in enumerate(stage):
@@ -92,6 +114,11 @@ def _keras_layer_map(model: KerasResNet152) -> dict[str, nn.Module]:
 
 
 def load_keras_resnet152(h5_path: Path = KERAS_WEIGHTS) -> KerasResNet152:
+    """Build the PyTorch ResNet-152 and copy in Keras' ImageNet weights (downloaded on first use).
+
+    This is the transfer-learning step: no training happens here, and the model is
+    returned in eval mode so BatchNorm uses the stored ImageNet statistics.
+    """
     import h5py
 
     if not h5_path.exists():
@@ -102,13 +129,14 @@ def load_keras_resnet152(h5_path: Path = KERAS_WEIGHTS) -> KerasResNet152:
     layers = _keras_layer_map(model)
     with h5py.File(h5_path, "r") as f:
         for name, mod in layers.items():
+            # e.g. "conv1_conv/kernel:0" -> "kernel"
             keys = [k.decode() if hasattr(k, "decode") else k for k in f[name].attrs["weight_names"]]
             w = {k.split("/")[-1].split(":")[0]: np.asarray(f[name][k]) for k in keys}
             with torch.no_grad():
                 if isinstance(mod, nn.Conv2d):
                     mod.weight.copy_(torch.from_numpy(w["kernel"].transpose(3, 2, 0, 1)))  # HWIO -> OIHW
                     mod.bias.copy_(torch.from_numpy(w["bias"]))
-                else:
+                else:  # BatchNorm: Keras gamma/beta are PyTorch weight/bias
                     mod.weight.copy_(torch.from_numpy(w["gamma"]))
                     mod.bias.copy_(torch.from_numpy(w["beta"]))
                     mod.running_mean.copy_(torch.from_numpy(w["moving_mean"]))
@@ -134,6 +162,8 @@ def preprocess(frames: np.ndarray, swap_rb: bool = True) -> torch.Tensor:
 
 
 def _crop(frame: np.ndarray, transform: str) -> np.ndarray:
+    """Frame -> 224x224. ``crop`` (SoccerNet's choice) scales height to 224 and keeps the
+    centre square, dropping the sides; ``resize`` squashes the whole frame instead."""
     h, w = frame.shape[:2]
     if transform == "resize":
         return cv2.resize(frame, (224, 224), interpolation=cv2.INTER_CUBIC)
@@ -156,10 +186,12 @@ def iter_frames(video: Path | str, fps: float = FPS, transform: str = "crop", st
     if not cap.isOpened():
         raise FileNotFoundError(video)
     vfps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    step = vfps / fps
+    step = vfps / fps  # source frames per kept frame, e.g. 12.5 for 25 fps -> 2 fps
     first, last = start_s * vfps, None if duration_s is None else (start_s + duration_s) * vfps
     if start_s > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, max(int(first) - 1, 0))
+    # Seeking can land before the requested frame, so trust the reported position
+    # and skip forward; ``i`` stays an absolute 1-indexed frame number for the grid.
     i = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
     buf = []
     while True:
@@ -201,6 +233,7 @@ def fit_pca(root: Path = SOCCERNET_DATA, max_halves: int = 20, out: Path = PCA_F
     if not xs:
         raise RuntimeError("no (ResNET_TF2, ResNET_TF2_PCA512) pairs found; download 1_ResNET_TF2.npy first")
     X, Y = np.concatenate(xs).astype(np.float64), np.concatenate(ys).astype(np.float64)
+    # Column of ones so the solve also learns the bias b (the PCA mean-centring).
     A = np.hstack([X, np.ones((len(X), 1))])
     sol, *_ = np.linalg.lstsq(A, Y, rcond=None)
     W, b = sol[:-1].astype(np.float32), sol[-1].astype(np.float32)
@@ -222,7 +255,10 @@ def load_pca(path: Path = PCA_FILE) -> tuple[np.ndarray, np.ndarray]:
 
 
 class FeatureExtractor:
-    """Video file -> (N, 2048) raw and (N, 512) PCA features at 2 fps."""
+    """Video file -> (N, 2048) raw and (N, 512) PCA features at 2 fps.
+
+    The 512-d PCA features are what ``TemporalSpotter`` consumes.
+    """
 
     def __init__(self, device: str | None = None, transform: str = "crop", swap_rb: bool = True,
                  pca_path: Path = PCA_FILE, half_precision: bool = False):

@@ -6,6 +6,7 @@ import argparse
 import dataclasses
 import json
 import logging
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -175,9 +176,12 @@ def cmd_spotting_train(a):
     from .spotting.train import TrainConfig, train
 
     cfg = TrainConfig(epochs=a.epochs, patience=a.patience, batch_size=a.batch_size, lr=a.lr, dim=a.dim,
-                      dropout=a.dropout, classes=a.classes, loss=a.loss, oversample=a.oversample, causal=a.causal,
+                      dropout=a.dropout, classes=a.classes, loss=a.loss, oversample=a.oversample,
+                      mixup_alpha=a.mixup, time_mask=a.time_mask, ema=a.ema, label_sigma=a.label_sigma,
+                      select_classes=a.select_classes, select_smooth=a.select_smooth, causal=a.causal,
                       delay_s=a.delay, seed=a.seed, max_train_games=a.max_games, num_threads=a.threads,
-                      num_workers=a.workers, device=a.device)
+                      num_workers=a.workers, device=a.device, window=a.window, edge=a.edge,
+                      dilations=tuple(a.dilations))
     train(cfg, Path(a.out))
 
 
@@ -187,13 +191,27 @@ def _device(name: str | None) -> str:
     return name or ("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def cmd_spotting_eval(a):
+def _load_spotters(a):
+    """One ``--model`` -> that spotter; several -> an ensemble named ``--name`` (default ``<stem>_ens<N>``)."""
     from .spotting.infer import load_spotter
+    from .spotting.train import load_ensemble
+
+    if len(a.model) == 1:
+        return (*load_spotter(a.model[0], _device(a.device)), a.name or Path(a.model[0]).stem)
+    model, ckpt = load_ensemble(a.model, _device(a.device))
+    name = a.name or re.sub(r"_s\d+$", "", Path(a.model[0]).stem) + f"_ens{len(a.model)}"
+    log.info("ensemble %s: valid mAP %.4f", name, ckpt["valid_map"])
+    return model, ckpt, name
+
+
+def cmd_spotting_eval(a):
     from .spotting.train import evaluate
 
-    model, ckpt = load_spotter(a.model, _device(a.device))
-    res = evaluate(model, a.split, max_games=a.max_games, ckpt=ckpt)
-    out = OUTPUTS / f"spotting_eval_{Path(a.model).stem}_{a.split}"
+    model, ckpt, name = _load_spotters(a)
+    res = evaluate(model, a.split, max_games=a.max_games, ckpt=ckpt, edge=a.edge)
+    if a.edge is not None:
+        name += f"_edge{a.edge}"
+    out = OUTPUTS / f"spotting_eval_{name}_{a.split}"
     out.mkdir(parents=True, exist_ok=True)
     pd.set_option("display.width", 200)
     report = res["ap"]
@@ -208,12 +226,17 @@ def cmd_spotting_eval(a):
     print(f"\noutputs -> {out}")
 
 
+def cmd_spotting_ensemble(a):
+    from .spotting.train import save_ensemble
+
+    save_ensemble(a.model, Path(a.out), _device(a.device))
+
+
 def cmd_spotting_official(a):
-    from .spotting.infer import load_spotter
     from .spotting.soccernet_eval import official_scores, write_predictions
 
-    model, ckpt = load_spotter(a.model, _device(a.device))
-    pred_dir = write_predictions(model, ckpt, a.split, OUTPUTS / f"soccernet_preds_{Path(a.model).stem}_{a.split}")
+    model, ckpt, name = _load_spotters(a)
+    pred_dir = write_predictions(model, ckpt, a.split, OUTPUTS / f"soccernet_preds_{name}_{a.split}")
     scores = official_scores(pred_dir, a.split)
     scores.to_csv(pred_dir / "official_scores.csv")
     print((scores * 100).round(1).to_string())
@@ -330,26 +353,160 @@ def cmd_cards_train(a):
     from .cards.train import CardTrainConfig, train
 
     cfg = CardTrainConfig(backbone=a.backbone, epochs=a.epochs, batch_size=a.batch_size, frames=a.frames,
+                          causal=a.causal, delay_s=a.delay, num_workers=a.workers, seed=a.seed)
+    tr, va = (pd.read_parquet(CLIPS_DIR / f"index_{s}.parquet") for s in ("train", "valid"))
+    train(cfg, tr, va, Path(a.out))
+
+
+def cmd_cards_live_eval(a):
+    from .cards.clips import CLIPS_DIR
+    from .cards.train import clip_live, live_report, load_card_model
+
+    model, ck = load_card_model(a.model, _device(a.device))
+    if not model.causal:
+        raise SystemExit(f"{a.model} is not causal; train it with `cards train --causal`")
+    idx = {s: pd.read_parquet(CLIPS_DIR / f"index_{s}.parquet") for s in ("valid", "test")}
+    live = {s: clip_live(model, idx[s], ck["config"]["frames"], num_workers=a.workers) for s in idx}
+    rep = live_report(live["valid"], idx["valid"], live["test"], idx["test"], a.precision)
+    CARDS_OUT.mkdir(parents=True, exist_ok=True)
+    rep.to_csv(CARDS_OUT / f"{Path(a.model).stem}_live.csv", index=False)
+    pd.set_option("display.width", 200)
+    print(f"live alerts by seconds after the card (trained delay {ck['config']['delay_s']:g}s; "
+          f"threshold set for {a.precision:.0%} precision on valid):")
+    print(rep.round(3).to_string(index=False))
+
+
+GOALS_OUT = OUTPUTS / "goals"
+
+
+def cmd_goals_build_clips(a):
+    from .goals.clips import CLIPS_DIR, extract, plan_clips
+
+    for split in a.splits:
+        plan = plan_clips(split, a.random_neg)
+        extract(plan, workers=a.workers)
+        plan.to_parquet(CLIPS_DIR / f"index_{split}.parquet", index=False)
+        print(split, plan["kind"].value_counts().to_dict())
+
+
+def cmd_goals_train(a):
+    from .goals.clips import CLIPS_DIR
+    from .goals.train import GoalTrainConfig, train
+
+    cfg = GoalTrainConfig(backbone=a.backbone, epochs=a.epochs, batch_size=a.batch_size, frames=a.frames,
                           num_workers=a.workers, seed=a.seed)
     tr, va = (pd.read_parquet(CLIPS_DIR / f"index_{s}.parquet") for s in ("train", "valid"))
     train(cfg, tr, va, Path(a.out))
 
 
+def cmd_goals_eval(a):
+    import numpy as np
+
+    from .goals.clips import CLIPS_DIR
+    from .goals.train import evaluate, load_goal_model
+
+    model, ck = load_goal_model(a.model, _device(a.device))
+    va, te = (pd.read_parquet(CLIPS_DIR / f"index_{s}.parquet") for s in ("valid", "test"))
+    out = evaluate(model, ck, va, te, num_workers=a.workers)
+    GOALS_OUT.mkdir(parents=True, exist_ok=True)
+    stem = Path(a.model).stem
+    out["delays"].to_csv(GOALS_OUT / f"{stem}_delays_test.csv", index=False)
+    out["by_kind"].to_csv(GOALS_OUT / f"{stem}_by_kind_test.csv", index=False)
+    np.save(GOALS_OUT / f"{stem}_scores_test.npy", out["test_scores"].to_numpy())
+    print("test, by delay after the ball crosses the line (thresholds fitted on valid):")
+    print(out["delays"].round(3).to_string(index=False))
+    print("\nlive score 2 s after the (would-be) goal, by clip kind:")
+    print(out["by_kind"].round(3).to_string(index=False))
+
+
 def cmd_cards_rescore(a):
-    from .cards.rescore import compare, fit_fusion
+    from .cards.clips import CLIP_FPS
+    from .cards.rescore import calibration_table, compare, fit_card_calibration, fit_fusion, spotter_at_candidates
     from .cards.train import clip_scores, load_card_model
 
-    model, ck = load_card_model(a.model, _device(a.device))
+    if a.visual_from is None:
+        model, ck = load_card_model(a.model, _device(a.device))
     cands = {}
     for split in ("valid", "test"):
         c = pd.read_parquet(CARDS_OUT / f"candidates_{split}.parquet")
         c["events"] = "[]"
-        p = clip_scores(model, c, ck["config"]["frames"], num_workers=a.workers)
+        if a.visual_from is not None:
+            prev = pd.read_parquet(CARDS_OUT / f"scored_{split}{a.visual_from}.parquet")
+            if not (prev["clip_id"].to_numpy() == c["clip_id"].to_numpy()).all():
+                raise SystemExit(f"scored_{split}{a.visual_from}.parquet has different candidates")
+            p = prev[["pv_yellow", "pv_red"]].to_numpy()
+        else:
+            p = clip_scores(model, c, ck["config"]["frames"], num_workers=a.workers,
+                            delay=int(round(ck["config"].get("delay_s", 0.0) * CLIP_FPS)), tta=a.tta)
         c["pv_yellow"], c["pv_red"] = p[:, 0], p[:, 1]
-        c.to_parquet(CARDS_OUT / f"scored_{split}.parquet", index=False)
+        if a.spotter:
+            s = spotter_at_candidates(a.spotter, split, c, device=_device(a.device))
+            c["sp_yellow_proposer"], c["sp_red_proposer"] = c["sp_yellow"], c["sp_red"]
+            c["sp_yellow"], c["sp_red"] = s["Yellow card"].to_numpy(), s["Sending off"].to_numpy()
+        c.to_parquet(CARDS_OUT / f"scored_{split}{a.tag}.parquet", index=False)
+        cands[split] = c
+    fusion = fit_fusion(cands["valid"])
+    platt = fit_card_calibration(cands["valid"], fusion)
+    res = compare(cands["test"], fusion)
+    res.to_csv(CARDS_OUT / f"rescore_test{a.tag}.csv", index=False)
+    cal = calibration_table(cands["test"], fusion, platt)
+    cal.to_csv(CARDS_OUT / f"calibration_test{a.tag}.csv", index=False)
+    pd.set_option("display.width", 200)
+    print(res.round(3).to_string(index=False))
+    print("\ncalibration on test (truth: one alert per real card within 10 s)")
+    print(cal.round(4).to_string(index=False))
+    if a.save:
+        import joblib
+
+        joblib.dump({"fusion": fusion, "platt": platt, "features": ["sp_yellow", "sp_red", "pv_yellow", "pv_red"],
+                     "spotter": a.spotter, "visual": a.model if a.visual_from is None else f"scored{a.visual_from}"},
+                    a.save)
+        print(f"saved fusion + calibration -> {a.save}")
+
+
+OFFSIDE_OUT = OUTPUTS / "offside"
+
+
+def cmd_offside_build_clips(a):
+    from .offside.clips import CLIPS_DIR, extract, plan_clips
+    from .offside.rescore import spotter_candidates
+
+    OFFSIDE_OUT.mkdir(parents=True, exist_ok=True)
+    for split in a.splits:
+        cand = spotter_candidates(a.spotter, split, a.min_score, device=_device(a.device))
+        cand.to_parquet(OFFSIDE_OUT / f"candidates{a.tag}_{split}.parquet", index=False)
+        neg = (a.confuser_neg, a.random_neg) if split != "test" else (0, 0)
+        plan = plan_clips(split, cand, *neg)
+        log.info("%s: %d candidates, %d clips planned", split, len(cand), len(plan))
+        extract(plan, workers=a.workers)
+        plan.to_parquet(CLIPS_DIR / f"index{a.tag}_{split}.parquet", index=False)
+        print(split, plan["kind"].value_counts().to_dict())
+
+
+def cmd_offside_train(a):
+    from .offside.clips import CLIPS_DIR
+    from .offside.train import OffsideTrainConfig, train
+
+    cfg = OffsideTrainConfig(backbone=a.backbone, epochs=a.epochs, batch_size=a.batch_size, frames=a.frames,
+                             lead=a.lead, num_workers=a.workers, seed=a.seed)
+    tr, va = (pd.read_parquet(CLIPS_DIR / f"index_{s}.parquet") for s in ("train", "valid"))
+    train(cfg, tr, va, Path(a.out))
+
+
+def cmd_offside_rescore(a):
+    from .offside.rescore import compare, fit_fusion
+    from .offside.train import clip_scores, load_offside_model
+
+    model, cfg = load_offside_model(a.model, _device(a.device))
+    cfg.num_workers = a.workers
+    cands = {}
+    for split in ("valid", "test"):
+        c = pd.read_parquet(OFFSIDE_OUT / f"candidates{a.tag}_{split}.parquet")
+        c["pv_offside"] = clip_scores(model, c, cfg)
+        c.to_parquet(OFFSIDE_OUT / f"scored_{Path(a.model).stem}{a.tag}_{split}.parquet", index=False)
         cands[split] = c
     res = compare(cands["test"], fit_fusion(cands["valid"]))
-    res.to_csv(CARDS_OUT / "rescore_test.csv", index=False)
+    res.to_csv(OFFSIDE_OUT / f"rescore_{Path(a.model).stem}{a.tag}_test.csv", index=False)
     pd.set_option("display.width", 200)
     print(res.round(3).to_string(index=False))
 
@@ -459,6 +616,7 @@ def cmd_replay_build(a):
         labels=Path(inputs["labels"]) if inputs["labels"] else None,
         report=Path(a.report) if a.report else None,
         live_model=Path(a.model),
+        extra_models=[Path(p) for p in a.extra_models if Path(p).exists()],
         hindsight_model=None if a.hindsight_model.lower() == "none" else Path(a.hindsight_model),
         event=a.event, kickoff=a.kickoff,
         video_kickoff_s=a.video_kickoff_s, video_second_half_s=a.video_second_half_s,
@@ -556,15 +714,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--files", nargs="+", help="per-game files, e.g. 1_ResNET_TF2.npy 2_ResNET_TF2.npy or 1_224p.mkv")
     s.set_defaults(fn=cmd_spotting_download)
     s = sp.add_parser("train")
-    s.add_argument("--classes", default="all", choices=["all", "cards", "cards_multitask"])
+    s.add_argument("--classes", default="all", choices=["all", "cards", "cards_multitask", "goal_multitask"])
     s.add_argument("--epochs", type=int, default=30)
     s.add_argument("--patience", type=int, default=6, help="early stopping on validation mAP")
     s.add_argument("--batch-size", type=int, default=64)
     s.add_argument("--lr", type=float, default=1e-3)
     s.add_argument("--dim", type=int, default=128)
     s.add_argument("--dropout", type=float, default=0.2)
-    s.add_argument("--loss", default="bce", choices=["bce", "focal"])
+    s.add_argument("--loss", default="bce", choices=["bce", "focal", "calf"],
+                   help="calf: context-aware loss (Cioppa et al., CVPR 2020) on the same spotter")
     s.add_argument("--oversample", type=int, default=0, help="extra windows per red card / penalty")
+    s.add_argument("--mixup", type=float, default=0.0, help="mixup Beta(a, a) alpha; 0 = off")
+    s.add_argument("--time-mask", type=int, default=0, help="max frames per masked span; 0 = off")
+    s.add_argument("--window", type=int, default=120, help="training window, frames (2 fps)")
+    s.add_argument("--edge", type=int, default=0,
+                   help="frames at each window end without loss; inference scores frames from window centres")
+    s.add_argument("--dilations", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    s.add_argument("--ema", type=float, default=0.0, help="weight EMA decay, e.g. 0.999; 0 = off")
+    s.add_argument("--label-sigma", type=float, default=0.0,
+                   help="Gaussian target std in frames (2 fps) instead of the +-1 s box; 0 = off")
+    s.add_argument("--select-classes", nargs="+", metavar="CLASS",
+                   help='pick the best epoch on these classes only, e.g. "Yellow card" (default: focus classes)')
+    s.add_argument("--select-smooth", type=int, default=1, help="average the selection score over N recent epochs")
     s.add_argument("--causal", action="store_true", help="past-only model (live alerts)")
     s.add_argument("--delay", type=float, default=0.0, help="causal look-ahead budget (s)")
     s.add_argument("--seed", type=int, default=0)
@@ -575,16 +746,24 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", default=str(MODELS / "spotter.pt"))
     s.set_defaults(fn=cmd_spotting_train)
     s = sp.add_parser("eval", help="AP, calibration and (causal) live latency on a split")
-    s.add_argument("--model", default=str(MODELS / "spotter.pt"))
+    s.add_argument("--model", nargs="+", default=[str(MODELS / "spotter.pt")], help="several = ensemble")
+    s.add_argument("--name", help="output name (default: model stem, or <stem>_ens<N> for an ensemble)")
     s.add_argument("--split", default="test")
     s.add_argument("--max-games", type=int)
+    s.add_argument("--edge", type=int, help="override the checkpoint's centred-inference edge (frames)")
     s.add_argument("--device")
     s.set_defaults(fn=cmd_spotting_eval)
     s = sp.add_parser("official-eval", help="SoccerNet's official average-mAP (17-class models)")
-    s.add_argument("--model", default=str(MODELS / "spotter.pt"))
+    s.add_argument("--model", nargs="+", default=[str(MODELS / "spotter.pt")], help="several = ensemble")
+    s.add_argument("--name", help="output name (default: model stem, or <stem>_ens<N> for an ensemble)")
     s.add_argument("--split", default="test")
     s.add_argument("--device")
     s.set_defaults(fn=cmd_spotting_official)
+    s = sp.add_parser("ensemble", help="save several spotters as one checkpoint (calibration refitted on valid)")
+    s.add_argument("--model", nargs="+", required=True)
+    s.add_argument("--out", required=True)
+    s.add_argument("--device")
+    s.set_defaults(fn=cmd_spotting_ensemble)
     s = sp.add_parser("fit-pca", help="recover SoccerNet's PCA-512 from raw/PCA feature pairs")
     s.add_argument("--max-halves", type=int, default=20)
     s.set_defaults(fn=cmd_spotting_fit_pca)
@@ -637,13 +816,77 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--frames", type=int, default=48)
     s.add_argument("--workers", type=int, default=12)
     s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--causal", action="store_true", help="past-only verifier (live alerts)")
+    s.add_argument("--delay", type=float, default=0.0, help="causal: seconds after the card the target sits")
     s.add_argument("--out", default=str(MODELS / "card_vision.pt"))
     s.set_defaults(fn=cmd_cards_train)
+    s = cd.add_parser("live-eval", help="causal model: AP and recall by seconds after the card")
+    s.add_argument("--model", default=str(MODELS / "card_vision_live.pt"))
+    s.add_argument("--precision", type=float, default=0.5, help="valid precision the alert threshold targets")
+    s.add_argument("--workers", type=int, default=12)
+    s.add_argument("--device")
+    s.set_defaults(fn=cmd_cards_live_eval)
     s = cd.add_parser("rescore", help="fuse spotter + visual scores (fit on valid), AP on test")
     s.add_argument("--model", default=str(MODELS / "card_vision.pt"))
+    s.add_argument("--tag", default="", help="suffix for the output files, e.g. _live_d2")
+    s.add_argument("--tta", action="store_true", help="also score the mirrored clip and average")
+    s.add_argument("--spotter", help="re-score the candidates' spotter features with this (e.g. newer) spotter")
+    s.add_argument("--visual-from", metavar="TAG", help="reuse visual scores from scored_<split><TAG>.parquet "
+                                                         "instead of running --model ('' = untagged)")
+    s.add_argument("--save", help="write the fitted fusion + Platt calibration here (joblib), e.g. models/card_fusion.joblib")
     s.add_argument("--workers", type=int, default=12)
     s.add_argument("--device")
     s.set_defaults(fn=cmd_cards_rescore)
+    od = groups.add_parser("offside", help="visual offside verifier on raw frames").add_subparsers(dest="cmd",
+                                                                                                   required=True)
+    s = od.add_parser("build-clips", help="spotter candidates + offside / stoppage clips from 224p videos")
+    s.add_argument("--spotter", required=True)
+    s.add_argument("--splits", nargs="+", default=["train", "valid", "test"])
+    s.add_argument("--min-score", type=float, default=0.1, help="lowest spotter peak kept as a candidate")
+    s.add_argument("--confuser-neg", type=int, default=6, help="other stoppages per half (hard negatives)")
+    s.add_argument("--random-neg", type=int, default=2, help="random moments per half")
+    s.add_argument("--tag", default="", help="suffix for candidate / index files, e.g. _ctx")
+    s.add_argument("--workers", type=int, default=12)
+    s.add_argument("--device")
+    s.set_defaults(fn=cmd_offside_build_clips)
+    s = od.add_parser("train")
+    s.add_argument("--backbone", default="regnet_y_800mf", choices=["regnet_y_800mf", "resnet18"])
+    s.add_argument("--epochs", type=int, default=12)
+    s.add_argument("--batch-size", type=int, default=6)
+    s.add_argument("--frames", type=int, default=48)
+    s.add_argument("--lead", type=int, default=16, help="frames before the candidate (4 fps)")
+    s.add_argument("--workers", type=int, default=12)
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--out", default=str(MODELS / "offside_vision.pt"))
+    s.set_defaults(fn=cmd_offside_train)
+    s = od.add_parser("rescore", help="fuse spotter + visual scores (fit on valid), Offside AP on test")
+    s.add_argument("--model", default=str(MODELS / "offside_vision.pt"))
+    s.add_argument("--tag", default="", help="candidate set written by build-clips --tag")
+    s.add_argument("--workers", type=int, default=12)
+    s.add_argument("--device")
+    s.set_defaults(fn=cmd_offside_rescore)
+
+    gd = groups.add_parser("goals", help="causal visual goal detector on shot clips").add_subparsers(dest="cmd",
+                                                                                                     required=True)
+    s = gd.add_parser("build-clips", help="12.5 fps clips around every shot / goal + random moments")
+    s.add_argument("--splits", nargs="+", default=["train", "valid", "test"])
+    s.add_argument("--random-neg", type=int, default=4, help="random moments per half")
+    s.add_argument("--workers", type=int, default=12)
+    s.set_defaults(fn=cmd_goals_build_clips)
+    s = gd.add_parser("train")
+    s.add_argument("--backbone", default="regnet_y_800mf", choices=["regnet_y_800mf", "resnet18"])
+    s.add_argument("--epochs", type=int, default=15)
+    s.add_argument("--batch-size", type=int, default=8)
+    s.add_argument("--frames", type=int, default=40, help="causal context window (frames at 12.5 fps)")
+    s.add_argument("--workers", type=int, default=12)
+    s.add_argument("--seed", type=int, default=0)
+    s.add_argument("--out", default=str(MODELS / "goal_vision.pt"))
+    s.set_defaults(fn=cmd_goals_train)
+    s = gd.add_parser("eval", help="speed vs accuracy on test, thresholds fitted on valid")
+    s.add_argument("--model", default=str(MODELS / "goal_vision.pt"))
+    s.add_argument("--workers", type=int, default=12)
+    s.add_argument("--device")
+    s.set_defaults(fn=cmd_goals_eval)
 
     od = groups.add_parser("opendata", help="open event data (StatsBomb)").add_subparsers(dest="cmd", required=True)
     s = od.add_parser("statsbomb", help="card rates and red-card scoring effect")
@@ -669,6 +912,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--labels", help="SoccerNet Labels-v2.json (ground truth + teams)")
     s.add_argument("--report", help="match-report CSV in `backtest --events` format (ground truth + teams)")
     s.add_argument("--model", default=str(MODELS / "live_d10.pt"), help="live (causal) spotter that drives trades")
+    s.add_argument("--extra-models", nargs="*", default=[str(MODELS / "goal_vision.pt"),
+                                                         str(MODELS / "sweep/goal_causal_d5_s0.pt"),
+                                                         str(MODELS / "sweep/goal_causal_d2_s0.pt")],
+                   help="more live models to switch to in the GUI (feature spotters or the visual goal "
+                        "detector); missing files are skipped")
     s.add_argument("--hindsight-model", default=str(MODELS / "spotter.pt"), help="'none' to skip")
     s.add_argument("--event", help="Kalshi event ticker (enables the market and trade panels)")
     s.add_argument("--kickoff")

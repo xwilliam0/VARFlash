@@ -104,7 +104,7 @@ def first_crossings(scores: np.ndarray, threshold: float, refractory_s: float = 
 
 
 def latency_report(live: list[tuple[str, np.ndarray, np.ndarray]], threshold: float, max_delay_s: float = 120.0,
-                   early_s: float = 10.0, budgets=(15, 30, 45, 60, 75)) -> dict:
+                   early_s: float = 10.0, budgets=(2, 5, 10, 15, 30, 45, 60, 75)) -> dict:
     """Live alerting quality for one class.
 
     ``live``: per half, (video, live scores (N,), true event times in s). A live score at

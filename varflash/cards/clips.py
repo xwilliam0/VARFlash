@@ -28,6 +28,7 @@ CLIP_FPS = 4
 STORE_HALF_S = 12.0  # stored window: centre +- 12 s
 CLIP_FRAMES = int(2 * STORE_HALF_S * CLIP_FPS)  # 96
 VIDEO_FILE = "{half}_224p.mkv"
+NEAREST_TOL_S = 0.019  # a frame up to just under half a 25 fps interval early counts as "at" a sample time
 CLIPS_DIR = SOCCERNET_DATA / "card_clips"
 CARD_CLASSES = ["Yellow card", "Sending off"]
 _SOURCE = {"Yellow card": 0, "Red card": 1, "Yellow->red card": 1}
@@ -43,36 +44,34 @@ def card_events(game_dir: Path) -> dict[int, list[tuple[float, int]]]:
     return out
 
 
-def read_windows(video: Path, centers_s: list[float], half_s: float = STORE_HALF_S, fps: int = CLIP_FPS,
+def read_windows(video: Path, centers_s: list[float], half_s: float = STORE_HALF_S, fps: float = CLIP_FPS,
                  jpeg_quality: int = 90) -> list[list[bytes]]:
     """One sequential pass over ``video``; returns, per centre, JPEG frames at ``fps``.
 
-    Frames outside the video are black. Sequential ``grab()`` is exact and, for many
+    Each sample time gets the frame nearest to it (by timestamp, at 25 fps). Timestamps,
+    not frame counts: some SoccerNet 224p files declare 25 fps but run at ~17 fps.
+    Times outside the video are black. Sequential ``grab()`` is exact and, for many
     windows per half, faster than seeking (which lands on keyframes in mkv).
     """
     cap = cv2.VideoCapture(str(video))
-    vfps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     n = int(2 * half_s * fps)
-    wanted: dict[int, list[tuple[int, int]]] = {}
-    for c, t0 in enumerate(centers_s):
-        for k in range(n):
-            f = int(round((t0 - half_s + k / fps) * vfps))
-            wanted.setdefault(f, []).append((c, k))
+    wanted = sorted((t0 - half_s + k / fps, c, k) for c, t0 in enumerate(centers_s) for k in range(n))
+    wanted = [w for w in wanted if w[0] >= 0]
     out: list[list[bytes | None]] = [[None] * n for _ in centers_s]
-    last = max((f for f in wanted if f < n_frames), default=-1)
-    shape = None
-    for f in range(last + 1):
-        if not cap.grab():
-            break
-        if f in wanted:
-            ok, frame = cap.retrieve()
-            if not ok:
-                continue
+    shape, j = None, 0
+    while j < len(wanted) and cap.grab():
+        t = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000 + NEAREST_TOL_S
+        if wanted[j][0] > t:
+            continue
+        ok, frame = cap.retrieve()
+        buf = None
+        if ok:
             shape = frame.shape
             buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])[1].tobytes()
-            for c, k in wanted[f]:
-                out[c][k] = buf
+        while j < len(wanted) and wanted[j][0] <= t:
+            _, c, k = wanted[j]
+            out[c][k] = buf
+            j += 1
     cap.release()
     black = cv2.imencode(".jpg", np.zeros(shape or (224, 398, 3), np.uint8))[1].tobytes()
     return [[b if b is not None else black for b in clip] for clip in out]

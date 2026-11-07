@@ -56,9 +56,11 @@ CLASS_SETS: dict[str, dict[str, list[str]]] = {
     "cards_multitask": {**{c: [c] for c in CLASSES if c not in ("Red card", "Yellow->red card")},
                         "Sending off": ["Red card", "Yellow->red card"]},
 }
+# Same outputs, selected on goals: the live goal alert that has to beat the market.
+CLASS_SETS["goal_multitask"] = CLASS_SETS["cards_multitask"]
 # Classes used for model selection / headline metrics of each set.
 FOCUS_CLASSES = {"all": CLASSES, "cards": ["Yellow card", "Sending off"],
-                 "cards_multitask": ["Yellow card", "Sending off"]}
+                 "cards_multitask": ["Yellow card", "Sending off"], "goal_multitask": ["Goal"]}
 RARE_CLASSES = ["Red card", "Yellow->red card", "Sending off", "Penalty"]
 
 
@@ -145,16 +147,24 @@ def half_events(game_dir: Path, classes: str | dict[str, list[str]] = "all") -> 
 
 
 def frame_targets(n_frames: int, events: list[tuple[int, int]], radius: int, n_classes: int = len(CLASSES),
-                  delay: int = 0) -> np.ndarray:
-    """Binary (n_frames, C) targets, 1 within ``radius`` frames of each event.
+                  delay: int = 0, sigma: float = 0.0) -> np.ndarray:
+    """(n_frames, C) targets: 1 within ``radius`` frames of each event, or with ``sigma`` > 0 a
+    Gaussian bump ``exp(-d^2 / 2 sigma^2)`` (d in frames, cut at 3 sigma; overlaps take the max).
 
     ``delay`` > 0 moves each target ``delay`` frames later: a causal model then has
     ``delay`` frames of look-ahead before it must report the event.
     """
     y = np.zeros((n_frames, n_classes), np.float32)
+    reach = int(np.ceil(3 * sigma))
     for f, c in events:
         f += delay
-        y[max(f - radius, 0) : max(min(f + radius + 1, n_frames), 0), c] = 1.0
+        if sigma > 0:
+            lo, hi = max(f - reach, 0), min(f + reach + 1, n_frames)
+            if lo < hi:
+                d = np.arange(lo, hi) - f
+                y[lo:hi, c] = np.maximum(y[lo:hi, c], np.exp(-0.5 * (d / sigma) ** 2))
+        else:
+            y[max(f - radius, 0) : max(min(f + radius + 1, n_frames), 0), c] = 1.0
     return y
 
 
@@ -165,17 +175,19 @@ class Half:
     features: np.ndarray  # (N, 512), memory-mapped or in RAM
     targets: np.ndarray  # (N, C)
     events: list[tuple[int, int]]  # (frame, class_idx), at the true event time (no delay)
+    shifts: np.ndarray | None = None  # (N, C) int time-shifts for the context-aware loss
 
 
 def load_halves(game_dirs: list[Path], radius: int = 2, classes: str | dict[str, list[str]] = "all",
-                delay: int = 0, in_memory: bool = False) -> list[Half]:
+                delay: int = 0, in_memory: bool = False, sigma: float = 0.0) -> list[Half]:
     n_classes = len(class_map(classes))
     halves = []
     for g in game_dirs:
         ev = half_events(g, classes)
         for h in (1, 2):
             feats = np.load(g / FEATURE_FILE.format(half=h), mmap_mode=None if in_memory else "r")
-            halves.append(Half(str(g), h, feats, frame_targets(len(feats), ev[h], radius, n_classes, delay), ev[h]))
+            y = frame_targets(len(feats), ev[h], radius, n_classes, delay, sigma)
+            halves.append(Half(str(g), h, feats, y, ev[h]))
     return halves
 
 
@@ -184,22 +196,36 @@ class WindowDataset(Dataset):
 
     ``oversample`` adds that many extra windows around every event of a class in
     ``oversample_classes`` (rare cards), so each epoch sees them far more often.
+
+    ``pad`` lets windows run up to that many frames past either end of the half
+    (zero features and targets), so a model trained without loss on its window
+    edges still supervises the first and last frames (kick-offs).
     """
 
     def __init__(self, halves: list[Half], window: int = 120, stride: int | None = None, train: bool = True,
-                 oversample: int = 0, oversample_classes: list[int] = ()):
+                 oversample: int = 0, oversample_classes: list[int] = (), pad: int = 0):
         self.halves = halves
         self.window = window
         self.train = train
+        self.pad = pad
         stride = stride or window // 2
         self.index = [
-            (i, s) for i, h in enumerate(halves) for s in range(0, max(len(h.features) - window, 0) + 1, stride)
+            (i, s) for i, h in enumerate(halves) for s in range(-pad, self._last_start(h) + 1, stride)
         ]
         if train and oversample:
             for i, h in enumerate(halves):
                 for f, c in h.events:
                     if c in oversample_classes:
-                        self.index += [(i, max(f - window // 2, 0))] * oversample
+                        self.index += [(i, max(f - window // 2, -pad))] * oversample
+
+    def _last_start(self, h: Half) -> int:
+        return max(len(h.features) - self.window + self.pad, -self.pad)
+
+    def _crop(self, a: np.ndarray, s: int, dtype) -> np.ndarray:
+        out = np.zeros((self.window, *a.shape[1:]), dtype)
+        lo, hi = max(s, 0), min(s + self.window, len(a))
+        out[lo - s : hi - s] = a[lo:hi]
+        return out
 
     def __len__(self):
         return len(self.index)
@@ -209,7 +235,8 @@ class WindowDataset(Dataset):
         h = self.halves[i]
         if self.train:
             j = self.window * 2 // 5  # keeps an oversampled event inside its window
-            s = int(np.clip(s + np.random.randint(-j, j + 1), 0, max(len(h.features) - self.window, 0)))
-        x = np.array(h.features[s : s + self.window], np.float32)
-        y = h.targets[s : s + self.window]
+            s = int(np.clip(s + np.random.randint(-j, j + 1), -self.pad, self._last_start(h)))
+        src = h.shifts if h.shifts is not None else h.targets
+        x = self._crop(h.features, s, np.float32)
+        y = self._crop(src, s, src.dtype)
         return torch.from_numpy(x), torch.from_numpy(y)

@@ -101,6 +101,7 @@ varflash spotting download --files 1_224p.mkv 2_224p.mkv   # ~190 GB
 varflash cards build-clips      # candidates + card / no-card-foul / random clips, stored as JPEG
 varflash cards train            # -> models/card_vision.pt
 varflash cards rescore          # test AP: spotter vs visual vs fused
+varflash cards rescore --visual-from "" --spotter models/cards.pt --tag _newspot  # refit fusion on a newer spotter
 ```
 
 On ORCD Engaging, `sbatch scripts/spotting_sweep.sbatch` trains the baseline and all card-model

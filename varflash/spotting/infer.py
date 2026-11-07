@@ -13,14 +13,37 @@ from .data import CLASSES, FPS
 from .model import TemporalSpotter
 
 
-def load_spotter(path: Path | str, device: str = "cpu") -> tuple[TemporalSpotter, dict]:
+def _build(model_args: dict, state_dict: dict) -> TemporalSpotter:
+    model = TemporalSpotter(**model_args)
+    model.load_state_dict(state_dict)
+    return model
+
+
+def load_spotter(path: Path | str, device: str = "cpu") -> tuple[torch.nn.Module, dict]:
+    """A single spotter, or a ``SpotterEnsemble`` for checkpoints written by ``spotting ensemble``."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model = TemporalSpotter(**ckpt["model_args"])
-    model.load_state_dict(ckpt["state_dict"])
+    if "members" in ckpt:
+        model = SpotterEnsemble([_build(m["model_args"], m["state_dict"]) for m in ckpt["members"]])
+    else:
+        model = _build(ckpt["model_args"], ckpt["state_dict"])
     model.to(device).eval()
     ckpt.setdefault("classes", CLASSES)
     ckpt.setdefault("delay", 0)
     return model, ckpt
+
+
+class SpotterEnsemble(torch.nn.Module):
+    """Averages member probabilities; returns logits so it drops in wherever a spotter does."""
+
+    def __init__(self, models: list[TemporalSpotter]):
+        super().__init__()
+        if len({m.causal for m in models}) > 1:
+            raise ValueError("cannot mix causal and bidirectional spotters")
+        self.models = torch.nn.ModuleList(models)
+        self.causal = models[0].causal
+
+    def forward(self, x):
+        return torch.logit(torch.stack([torch.sigmoid(m(x)) for m in self.models]).mean(0), eps=1e-6)
 
 
 def _device(model: torch.nn.Module) -> torch.device:
@@ -28,14 +51,31 @@ def _device(model: torch.nn.Module) -> torch.device:
 
 
 @torch.no_grad()
-def frame_scores(model: TemporalSpotter, features: np.ndarray, window: int = 120) -> np.ndarray:
+def _centred_scores(model: TemporalSpotter, features: np.ndarray, window: int, edge: int) -> np.ndarray:
+    n, core = len(features), window - 2 * edge
+    x = np.zeros((n + window, features.shape[1]), np.float32)
+    x[edge : edge + n] = features
+    xt = torch.from_numpy(x).to(_device(model))
+    starts = range(0, n, core)
+    batch = torch.stack([xt[s : s + window] for s in starts])
+    out = torch.cat([torch.sigmoid(model(b)) for b in batch.split(256)]).float().cpu().numpy()
+    return out[:, edge : edge + core].reshape(-1, out.shape[-1])[:n]
+
+
+@torch.no_grad()
+def frame_scores(model: TemporalSpotter, features: np.ndarray, window: int = 120, edge: int = 0) -> np.ndarray:
     """Sigmoid scores (N, C).
 
     Bidirectional models: average of overlapping half-stride windows (each frame sees
-    up to ``window`` frames of future). Causal models: each frame is scored by a window
-    that ends at or after it but whose output for that frame only depends on the past,
-    and has at least ``window // 2`` frames of history, so the scores are live-valid.
+    up to ``window`` frames of future). With ``edge`` > 0, each frame is instead scored
+    only by the window it sits in the centre of, with at least ``edge`` frames of context
+    on both sides (zero-padded past the ends of the half, as in training).
+    Causal models: each frame is scored by a window that ends at or after it but whose
+    output for that frame only depends on the past, and has at least ``window // 2``
+    frames of history, so the scores are live-valid.
     """
+    if edge > 0 and not getattr(model, "causal", False):
+        return _centred_scores(model, np.asarray(features, np.float32), window, edge)
     n = len(features)
     feats = torch.from_numpy(np.array(features, np.float32)).to(_device(model))
     starts = list(range(0, max(n - window, 0) + 1, window // 2))
@@ -98,7 +138,8 @@ def spot(model: TemporalSpotter, features: np.ndarray, ckpt: dict | None = None,
     delay = ckpt.get("delay", 0)
     kw.setdefault("classes", ckpt.get("classes", CLASSES))
     kw.setdefault("calibrators", ckpt.get("calibrators"))
-    window = ckpt.get("config", {}).get("window", 120)
-    ev = peak_pick(event_scores(frame_scores(model, features, window), delay), **kw)
+    cfg = ckpt.get("config", {})
+    ev = peak_pick(event_scores(frame_scores(model, features, cfg.get("window", 120), cfg.get("edge", 0)), delay),
+                   **kw)
     ev["fire_s"] = ev["time_s"] + delay / FPS
     return ev.sort_values("time_s").reset_index(drop=True)

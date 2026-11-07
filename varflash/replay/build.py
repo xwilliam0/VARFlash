@@ -167,6 +167,25 @@ def run_model(path: Path, feats: list[np.ndarray], offsets: list[float], n_frame
     return scores, alerts.sort_values("fire_s").reset_index(drop=True), meta
 
 
+def score_model(path: Path, feats: list[np.ndarray], offsets: list[float], n_frames: int, video: Path,
+                device: str) -> tuple[dict[str, np.ndarray], pd.DataFrame, dict]:
+    """Feature spotter (``run_model``) or visual goal detector (runs on the session video)."""
+    from ..goals.stream import is_goal_vision, run_goal_vision
+
+    if is_goal_vision(path):
+        return run_goal_vision(path, video, n_frames, FPS, device)
+    return run_model(path, feats, offsets, n_frames, device)
+
+
+def model_label(meta: dict) -> str:
+    name = Path(meta["path"]).stem
+    if meta.get("kind") == "vision":
+        return f"Visual goal detector, goals only ({name})"
+    if not meta["causal"]:
+        return f"Feature spotter, not causal ({name})"
+    return f"Feature spotter, {meta['delay_s']:g}s look-ahead ({name})"
+
+
 # ---- reference events -------------------------------------------------------
 
 
@@ -183,7 +202,11 @@ def soccernet_truth(labels: Path, offsets: list[float]) -> tuple[pd.DataFrame, d
             "team": x["team"] if x.get("team") in ("home", "away") else None,
             "visible": x.get("visibility") == "visible",
         })
-    return pd.DataFrame(rows), {"home": a.get("gameHomeTeam"), "away": a.get("gameAwayTeam")}
+    # Some games annotate the same goal twice, a fraction of a second apart.
+    truth = pd.DataFrame(rows).sort_values(["label", "video_s"])
+    dup = (truth["label"] == truth["label"].shift()) & (truth["video_s"].diff() < 2.0)
+    truth = truth[~dup].sort_values("video_s").reset_index(drop=True)
+    return truth, {"home": a.get("gameHomeTeam"), "away": a.get("gameAwayTeam")}
 
 
 def report_truth(path: Path, video_kickoff_s: float, video_second_half_s: float | None) -> pd.DataFrame:
@@ -354,6 +377,7 @@ def build_session(
     labels: Path | None = None,
     report: Path | None = None,
     live_model: Path = LIVE_MODEL,
+    extra_models: list[Path] = (),
     hindsight_model: Path | None = HINDSIGHT_MODEL,
     event: str | None = None,
     kickoff: str | None = None,
@@ -369,7 +393,8 @@ def build_session(
     root: Path = SESSIONS,
 ) -> Path:
     """``clips``: build from a highlights video instead, one real-time segment per anchored clip
-    (see ``make_clip_video``); ``clip_pad_s`` is the frozen lead-in / run-out around each clip."""
+    (see ``make_clip_video``); ``clip_pad_s`` is the frozen lead-in / run-out around each clip.
+    ``extra_models``: more live models the GUI can switch to; each gets its own alerts and trades."""
     import torch
 
     from ..backtest import MatchClock, StrategyConfig
@@ -394,8 +419,7 @@ def build_session(
 
     feats = load_features(videos, features, out, device)
     n_frames = int(math.ceil(duration_s * FPS))
-    live_scores, alerts, live_meta = run_model(live_model, feats, offsets, n_frames, device)
-    alerts.insert(0, "id", range(len(alerts)))
+    raw = [score_model(Path(p), feats, offsets, n_frames, video, device) for p in [live_model, *extra_models]]
     hindsight = None
     if hindsight_model:
         h_scores, h_alerts, h_meta = run_model(hindsight_model, feats, offsets, n_frames, device)
@@ -434,38 +458,53 @@ def build_session(
             clock = SegmentClock(clock, segments)
         teams = teams or _team_names(m.title)
 
-    alerts = attach_teams(alerts, truth, match_tol_s)
-    alerts["no_trade"] = None
-    if segments:
-        footage = [s["footage"] for s in segments]
-        frozen = ~alerts["time_s"].map(lambda t: any(a <= t <= b for a, b in footage))
-        minute = alerts["time_s"].map(lambda t: clock.match_minute(clock.video_to_utc(t)))
-        alerts.loc[minute > REGULATION_MINUTE, "no_trade"] = "extra time: in-play model covers regulation only"
-        alerts.loc[frozen, "no_trade"] = "frozen frame, no footage"
-    alerts["trade_eligible"] = (alerts["confidence"] >= trade_min_confidence) & alerts["no_trade"].isna()
+    book = QuoteBook(m) if m is not None else None
+    cfg = strategy or StrategyConfig()
 
+    def model_entry(scores: dict, alerts: pd.DataFrame, meta: dict) -> dict:
+        alerts = alerts.sort_values("fire_s").reset_index(drop=True)
+        alerts.insert(0, "id", range(len(alerts)))
+        alerts = attach_teams(alerts, truth, match_tol_s)
+        alerts["no_trade"] = None
+        if segments:
+            footage = [s["footage"] for s in segments]
+            frozen = ~alerts["time_s"].map(lambda t: any(a <= t <= b for a, b in footage))
+            minute = alerts["time_s"].map(lambda t: clock.match_minute(clock.video_to_utc(t)))
+            alerts.loc[minute > REGULATION_MINUTE, "no_trade"] = "extra time: in-play model covers regulation only"
+            alerts.loc[frozen, "no_trade"] = "frozen frame, no footage"
+        alerts["trade_eligible"] = (alerts["confidence"] >= trade_min_confidence) & alerts["no_trade"].isna()
+        entry = {"key": Path(meta["path"]).stem, "label": model_label(meta),
+                 "live": {"model": meta, "scores": _scores_json(scores)},
+                 "alerts": alerts.drop(columns=["frame"]).to_dict("records"),
+                 "scorecard": scorecard(alerts, truth, trade_min_confidence, match_tol_s),
+                 "decisions": [], "fills": [], "summary": None}
+        if m is not None:
+            entry["decisions"], entry["fills"], entry["summary"] = trade_section(m, clock, book, alerts, cfg)
+        return entry
+
+    models = [model_entry(*r) for r in raw]
     session = {
-        "version": 1, "name": name, "note": note,
+        "version": 2, "name": name, "note": note,
         "title": m.title if m else (f"{teams['home']} vs {teams['away']}" if teams else name),
         "teams": teams, "video": "video.mp4", "duration_s": duration_s,
         "segments": [{"start_s": o, "source": str(v)} for o, v in zip(offsets, videos)],
         "clock": {"video_kickoff_s": video_kickoff_s, "video_second_half_s": video_second_half_s},
-        "fps": FPS, "live": {"model": live_meta, "scores": _scores_json(live_scores)}, "hindsight": hindsight,
-        "alerts": alerts.drop(columns=["frame"]).to_dict("records"),
+        "fps": FPS, "hindsight": hindsight,
         "truth": truth.sort_values("video_s").to_dict("records"),
         "trade_min_confidence": trade_min_confidence,
-        "scorecard": scorecard(alerts, truth, trade_min_confidence, match_tol_s),
-        "market": None, "decisions": [], "fills": [], "summary": None,
+        "market": None,
+        # The first model is the default; the GUI copies the chosen entry's fields to the top level.
+        **{k: models[0][k] for k in ("live", "alerts", "scorecard", "decisions", "fills", "summary")},
+        "models": [{"key": e["key"], "label": e["label"]} for e in models],
     }
     if segments:
         session["clock"]["segments"] = segments
     if m is not None:
-        book = QuoteBook(m)
-        cfg = strategy or StrategyConfig()
         session["clock"].update(kickoff_utc=clock.kickoff_utc, second_half_utc=clock.second_half_utc)
         session["market"] = market_section(m, clock, book, duration_s)
-        session["decisions"], session["fills"], session["summary"] = trade_section(m, clock, book, alerts, cfg)
         session["strategy"] = {k: str(v) if isinstance(v, pd.Timedelta) else v for k, v in vars(cfg).items()}
+    for e in models[1:]:
+        (out / f"model_{e['key']}.json").write_text(json.dumps(_clean(e), separators=(",", ":")))
 
     (out / "session.json").write_text(json.dumps(_clean(session), separators=(",", ":")))
     log.info("session -> %s", out)
